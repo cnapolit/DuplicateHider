@@ -32,6 +32,17 @@ using DuplicateHider.Views;
 using StartPage.SDK;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
+using WikiClientLibrary.Client;
+using WikiClientLibrary.Sites;
+using WikiClientLibrary.Pages.Queries;
+using WikiClientLibrary.Pages.Queries.Properties;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Net.Sockets;
+using System.Net;
+using System.Collections;
+using System.Security.Policy;
+using static System.Windows.Forms.VisualStyles.VisualStyleElement.TrackBar;
 
 [assembly: System.Runtime.CompilerServices.InternalsVisibleTo("DuplicateHider")]
 namespace DuplicateHider
@@ -118,6 +129,8 @@ namespace DuplicateHider
             });
 
             AddSettingsSupport(new AddSettingsSupportArgs { SettingsRoot = "Settings", SourceName = "DuplicateHider" });
+
+            httpClient.DefaultRequestHeaders.Add("User-Agent", $"PlayniteDuplicateHider/{GetLocalIPAddress()}");
         }
 
         internal void UpdateGuidToCopiesDict()
@@ -803,6 +816,10 @@ namespace DuplicateHider
                     }
                     comp = gameA.CompareTo(gameB, Instance.settings.PriorityProperties);
                 }
+                
+                // Wait for initialization to complete.
+                // Throws error if any.
+
 
                 //var val = CompareOld(x, y);
 
@@ -843,7 +860,98 @@ namespace DuplicateHider
             }
         }
 
-#endregion
+        private readonly HttpClient httpClient = new HttpClient();
+        private readonly Dictionary<string, List<Guid>> wikidataIndex = new Dictionary<string, List<Guid>>();
+
+        private async Task<string> QueryWikidata(Game game)
+        {
+            var repeat = false;
+            HttpResponseMessage response;
+
+            try
+            {
+                do
+                {
+                    var url = ConstructWikiDataSparqlQuery(game);
+                    if (url is null)
+                    {
+                        return null;
+                    }
+
+                    response = await httpClient.GetAsync(url);
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        if (response.StatusCode != (HttpStatusCode)429
+                         || !response.Content.Headers.TryGetValues("Retry-After", out var values)
+                         || !int.TryParse(values.FirstOrDefault(), out var time))
+                        {
+                            return null;
+                        }
+
+                        repeat = true;
+                        await Task.Delay(time * 1000);
+                    }
+
+                } while (repeat);
+            }
+            catch (Exception e)
+            {
+                logger.Error(e, "Found exception while querying wikidata");
+                return null;
+            }
+
+            var serializedContent = await response.Content.ReadAsStringAsync();
+            dynamic content = JsonConvert.DeserializeObject(serializedContent);
+
+            var results = content.results.bindings;
+            if (results.Count != 1)
+            {
+                return null;
+            }
+
+            return results[0].item.value.ToString().Substring(31);
+        }
+
+        static string GetLocalIPAddress()
+        {
+            var host = Dns.GetHostEntry(Dns.GetHostName());
+            foreach (var ip in host.AddressList)
+            {
+                if (ip.AddressFamily == AddressFamily.InterNetwork)
+                {
+                    return ip.ToString();
+                }
+            }
+            throw new Exception("No network adapters with an IPv4 address in the system!");
+        }
+
+        private const string BaseUrl = "https://query.wikidata.org/bigdata/namespace/wdq/sparql?format=json&query=";
+        private const string DefaultQuery = BaseUrl + "SELECT DISTINCT ?item WHERE {{?item p:{0} ?statement0. ?statement0 (ps:{0}) \"{1}\". ?item p:P31/ps:P31 wd:Q7889.}}";
+        private const string PlayStationQuery = BaseUrl + "SELECT DISTINCT ?item WHERE {{?item p:P5944/ps:P5944 ?val. FILTER regex(?val, \".*-{0}-.*\"). ?item p:P31/ps:P31 wd:Q7889.}}";
+        private static string ConstructWikiDataSparqlQuery(Game game)
+        {
+            string source;
+            switch (game.Source.Name.ToLower())
+            {
+                default:            return null;
+                case "playstation":
+                    return string.Format(PlayStationQuery, game.GameId);
+                case "epic":      source = "P6278"; break;
+                case "microsoft": source = "P5885"; break;
+                case "nintendo":  source = "P8084"; break;
+                case "steam":     source = "P1733"; break;
+                //case "amazon": return "";
+                //case "app store": source = "P3861"; break;
+                //case "ea app": return "";
+                //case "gog": return "P2725";
+                //case "play store": source = "P3418"; break;
+                //case "humble": return "P4477";
+            }
+
+            return string.Format(DefaultQuery, source, game.GameId);
+        }
+
+        #endregion
 
         public override ISettings GetSettings(bool firstRunSettings)
         {
@@ -942,6 +1050,23 @@ namespace DuplicateHider
                         PlayniteApi.Database.Games.ItemCollectionChanged -= Games_ItemCollectionChanged;
                         BuildIndex(PlayniteApi.Database.Games, GetGameFilter(), GetNameFilter());
                         var hidden = SetDuplicateState(Hidden);
+                        PlayniteApi.Database.Games.Update(hidden);
+                        PlayniteApi.Dialogs.ShowMessage(string.Format(ResourceProvider.GetString("LOC_DH_NGamesHidden"), hidden.Where(g => g.Hidden).Count()), "DuplicateHider");
+                        PlayniteApi.Database.Games.ItemUpdated += Games_ItemUpdated;
+                        PlayniteApi.Database.Games.ItemCollectionChanged += Games_ItemCollectionChanged;
+                        UpdateGuidToCopiesDict();
+                        GroupUpdated?.Invoke(this, PlayniteApi.Database.Games.Select(g => g.Id));
+                    }
+                },
+                new MainMenuItem
+                {
+                    Description = "test",
+                    MenuSection = "@|DuplicateHider",
+                    Action = async _ => {
+                        PlayniteApi.Database.Games.ItemUpdated -= Games_ItemUpdated;
+                        PlayniteApi.Database.Games.ItemCollectionChanged -= Games_ItemCollectionChanged;
+                        await BuildWikiDataIndexAsync(PlayniteApi.Database.Games, GetGameFilter());
+                        var hidden = SetDuplicateState(Hidden, wikidataIndex);
                         PlayniteApi.Database.Games.Update(hidden);
                         PlayniteApi.Dialogs.ShowMessage(string.Format(ResourceProvider.GetString("LOC_DH_NGamesHidden"), hidden.Where(g => g.Hidden).Count()), "DuplicateHider");
                         PlayniteApi.Database.Games.ItemUpdated += Games_ItemUpdated;
@@ -1507,11 +1632,13 @@ namespace DuplicateHider
             }
         }
 
-        private IList<Game> SetDuplicateState(Visibility visibility)
+        private IList<Game> SetDuplicateState(Visibility visibility, Dictionary<string, List<Guid>> index = null)
         {
+            index = index ?? Index;
+
             List<Game> toUpdate = new List<Game> { };
             bool hidden = visibility == Hidden;
-            foreach (var copies in Index.Values)
+            foreach (var copies in index.Values)
             {
                 for (int i = 1; i < copies.Count; ++i)
                 {
@@ -1557,6 +1684,56 @@ namespace DuplicateHider
                 }
 
                 Index[cleanName].InsertSorted(game.Id, GameComparer.Comparer);
+            }
+        }
+
+        private async Task BuildWikiDataIndexAsync(IEnumerable<Game> games, IFilter<IEnumerable<Game>> gameFilter)
+        {
+            wikidataIndex.Clear();
+
+            var filteredGames = games.Filter(gameFilter).Where(g => g.GameId != null).ToList();
+            if (filteredGames.Count is 0)
+            {
+                return;
+            }
+
+            const int QueryLimit = 5;
+            var tasks = new List<Task<string>>(QueryLimit) { QueryWikidata(filteredGames[0]) };
+            for (var i = 1; i < filteredGames.Count; i++)
+            {
+                if (i % QueryLimit is 0)
+                {
+                    await AwaitTasksAsync(tasks, filteredGames, i);
+                }
+
+                tasks.Add(QueryWikidata(filteredGames[i]));
+            }
+            
+            await AwaitTasksAsync(tasks, filteredGames, filteredGames.Count);
+        }
+
+        private async Task AwaitTasksAsync(List<Task<string>> tasks, List<Game> filteredGames, int i)
+        {
+            var ids = await Task.WhenAll(tasks);
+            var idList = ids.ToList();
+
+            var baseIndex = i - idList.Count;
+            for (var j = 0; j < idList.Count; j++)
+            {
+                var wikidataId = idList[j];
+                if (wikidataId is null)
+                {
+                    continue; 
+                }
+
+                var gameUid = filteredGames[baseIndex + j].Id;
+                if (wikidataIndex.TryGetValue(wikidataId, out var guids))
+                {
+                    guids.InsertSorted(gameUid, GameComparer.Comparer);
+                    continue;
+                }
+
+                wikidataIndex[wikidataId] = new List<Guid> { gameUid };
             }
         }
 
